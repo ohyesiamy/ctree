@@ -152,6 +152,34 @@ test('HTTP API: ping / tree / 403 / copy', async () => {
   const mdOut = await req(port, 'GET', '/md?path=..%2Fetc');
   assert.strictEqual(mdOut.status, 403);
 
+  // コードビューア: エスケープ + word wrap + 言語クラス
+  fs.writeFileSync(path.join(root, 'app.ts'), 'const a: number = 1 < 2 ? 3 : 4;\n');
+  const code = await req(port, 'GET', '/code?path=app.ts');
+  assert.strictEqual(code.status, 200);
+  assert.ok(code.body.includes('language-typescript'));
+  assert.ok(code.body.includes('1 &lt; 2'));
+  assert.ok(code.body.includes('white-space: pre-wrap'));
+
+  // バイナリはプレビュー不可メッセージ
+  fs.writeFileSync(path.join(root, 'bin.dat'), Buffer.from([0, 1, 2, 3]));
+  const bin = await req(port, 'GET', '/code?path=bin.dat');
+  assert.ok(bin.body.includes('バイナリファイルはプレビューできません'));
+
+  // 画像: raw 配信の content-type と img ページ
+  fs.writeFileSync(path.join(root, 'logo.svg'), '<svg xmlns="http://www.w3.org/2000/svg"/>');
+  const raw = await new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path: '/raw?path=logo.svg' }, (r) => {
+      resolve({ status: r.statusCode, type: r.headers['content-type'] });
+      r.resume();
+    }).on('error', reject);
+  });
+  assert.strictEqual(raw.status, 200);
+  assert.strictEqual(raw.type, 'image/svg+xml');
+  const img = await req(port, 'GET', '/img?path=logo.svg');
+  assert.ok(img.body.includes('/raw?path=logo.svg'));
+  const rawOut = await req(port, 'GET', '/raw?path=..%2F..%2Fetc%2Fhosts');
+  assert.strictEqual(rawOut.status, 403);
+
   server.close();
   delete process.env.CTREE_COPY_CMD;
 });

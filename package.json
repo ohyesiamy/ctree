@@ -1,0 +1,43 @@
+{
+  "name": "@ohyesiamy/ctree",
+  "version": "0.2.0",
+  "description": "Editor-style file tree for cmux — click any file to copy its absolute path. Ships markdown, code, and image viewers. Zero dependencies.",
+  "bin": {
+    "ctree": "./ctree.js"
+  },
+  "files": [
+    "ctree.js",
+    "README.md",
+    "README.ja.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ohyesiamy/ctree.git"
+  },
+  "homepage": "https://github.com/ohyesiamy/ctree#readme",
+  "bugs": {
+    "url": "https://github.com/ohyesiamy/ctree/issues"
+  },
+  "keywords": [
+    "cmux",
+    "file-tree",
+    "claude-code",
+    "terminal",
+    "clipboard",
+    "markdown-viewer",
+    "cli",
+    "macos"
+  ],
+  "author": "ohyesiamy",
+  "license": "MIT"
+}

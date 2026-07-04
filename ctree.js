@@ -13,6 +13,25 @@ const { spawn, spawnSync } = require('child_process');
 const CACHE_DIR = path.join(os.homedir(), '.cache', 'ctree');
 const MAX_WATCHERS = 256;
 const MAX_ENTRIES = 2000;
+const MAX_CODE_BYTES = 2 * 1024 * 1024;
+
+const MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  svg: 'image/svg+xml', webp: 'image/webp', ico: 'image/x-icon', avif: 'image/avif',
+  heic: 'image/heic', bmp: 'image/bmp', pdf: 'application/pdf',
+};
+
+// 拡張子 → highlight.js の言語 id (未知の拡張子は hljs の自動判定に任せる)
+const HLJS_LANG = {
+  js: 'javascript', mjs: 'javascript', cjs: 'javascript', jsx: 'javascript',
+  ts: 'typescript', tsx: 'typescript', py: 'python', rb: 'ruby', go: 'go',
+  rs: 'rust', c: 'c', h: 'c', cpp: 'cpp', hpp: 'cpp', swift: 'swift',
+  sh: 'bash', zsh: 'bash', bash: 'bash', css: 'css', scss: 'scss',
+  html: 'xml', xml: 'xml', vue: 'xml', svelte: 'xml', json: 'json',
+  yml: 'yaml', yaml: 'yaml', toml: 'ini', ini: 'ini', md: 'markdown',
+  sql: 'sql', php: 'php', java: 'java', kt: 'kotlin', lua: 'lua',
+  pl: 'perl', r: 'r', dockerfile: 'dockerfile', makefile: 'makefile',
+};
 
 // ---------------------------------------------------------------- gitignore
 
@@ -241,6 +260,46 @@ function createApp(root) {
           ensureWatch(parent);
           res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
           res.end(renderMdPage(root, rel, renderMarkdown(src)));
+        } catch (e) {
+          json(res, 500, { error: readableFsError(e) });
+        }
+      } else if (url.pathname === '/raw') {
+        const rel = safeRel(root, url.searchParams.get('path') || '');
+        if (rel === null) return json(res, 403, { error: 'root 外のパスです' });
+        try {
+          const abs = path.join(root, ...rel.split('/').filter(Boolean));
+          const ext = (rel.split('.').pop() || '').toLowerCase();
+          const buf = fs.readFileSync(abs);
+          res.writeHead(200, {
+            'content-type': MIME[ext] || 'application/octet-stream',
+            'cache-control': 'no-cache',
+          });
+          res.end(buf);
+        } catch (e) {
+          json(res, 500, { error: readableFsError(e) });
+        }
+      } else if (url.pathname === '/img') {
+        const rel = safeRel(root, url.searchParams.get('path') || '');
+        if (rel === null) return json(res, 403, { error: 'root 外のパスです' });
+        const parent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+        ensureWatch(parent);
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+        res.end(renderImgPage(root, rel));
+      } else if (url.pathname === '/code') {
+        const rel = safeRel(root, url.searchParams.get('path') || '');
+        if (rel === null) return json(res, 403, { error: 'root 外のパスです' });
+        try {
+          const abs = path.join(root, ...rel.split('/').filter(Boolean));
+          const buf = fs.readFileSync(abs);
+          let note = null;
+          let text = '';
+          if (buf.length > MAX_CODE_BYTES) note = 'ファイルが大きすぎるためプレビューできません (2MB 上限)';
+          else if (buf.includes(0)) note = 'バイナリファイルはプレビューできません';
+          else text = buf.toString('utf8');
+          const parent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+          ensureWatch(parent);
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end(renderCodePage(root, rel, text, note));
         } catch (e) {
           json(res, 500, { error: readableFsError(e) });
         }
@@ -652,7 +711,7 @@ ctree --no-open    <span class="cm"># ペインを開かず URL だけ表示</sp
     <p>同じ<wbr>ディレクトリに<wbr>対しては、<span class="nb">サーバと</span><wbr><span class="nb">表示ペインを</span><wbr>再利用します。<wbr>何度<wbr>実行しても<wbr>ペインは<wbr>増えません。</p>
     <h3>操作</h3>
     <p><span class="nb">行を</span><wbr><span class="nb">クリック</span>すると<wbr><span class="nb">絶対パスを</span><wbr><span class="nb">コピー。</span><wbr>フォルダは<wbr><span class="kbd">▶</span> で<wbr>開閉。<wbr><span class="nb">右上の</span><wbr><span class="nb">目のアイコンで</span><wbr><span class="nb">隠しファイルを</span><wbr>表示。</p>
-    <p><span class="nb">.md ファイルは</span><wbr><span class="nb">本のアイコンで</span><wbr><span class="nb">markdown ビューアを</span><wbr>開けます<wbr>(cmux の<wbr><span class="nb">ネイティブビューア、</span><wbr><span class="nb">使えない場合は</span><wbr><span class="nb">内蔵ビューアに</span><wbr><span class="nb">自動切替。</span><wbr><span class="nb">どちらも live reload 付き)。</span></p>
+    <p><span class="nb">ファイル行の</span><wbr><span class="nb">右端のアイコンで</span><wbr>プレビュー:<wbr><span class="nb">.md は</span><wbr><span class="nb">markdown ビューア、</span><wbr><span class="nb">画像は</span><wbr><span class="nb">画像ビューア、</span><wbr><span class="nb">その他は</span><wbr><span class="nb">コードビューア</span><wbr><span class="nb">(シンタックスハイライト +</span><wbr><span class="nb">word wrap 付き)。</span><wbr><span class="nb">すべて live reload 対応。</span></p>
     <h3>Claude Code hook (自動起動)</h3>
     <p><span class="nb">~/.claude/settings.json</span> に<wbr>追加すると、<wbr><span class="nb">セッション開始時に</span><wbr><span class="nb">作業ディレクトリの</span><wbr><span class="nb">ツリーが</span><wbr><span class="nb">自動で</span><wbr>開きます:</p>
     <pre><code>{
@@ -684,7 +743,8 @@ const SVG = {
   conf: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6 2.5c-1.4.4-2 1-2 2.4 0 1.7-.4 2.4-2 3.1 1.6.7 2 1.4 2 3.1 0 1.4.6 2 2 2.4M10 2.5c1.4.4 2 1 2 2.4 0 1.7.4 2.4 2 3.1-1.6.7-2 1.4-2 3.1 0 1.4-.6 2-2 2.4"/></svg>',
   doc: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3"><path d="M3.5 1.5h6L12.5 4.5v10h-9z"/><path d="M5.5 7h5M5.5 9.5h5M5.5 12h3"/></svg>',
   link: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M6.5 9.5l3-3M5 7.5L3.5 9a2.5 2.5 0 0 0 3.5 3.5L8.5 11M11 8.5L12.5 7A2.5 2.5 0 0 0 9 3.5L7.5 5"/></svg>',
-  book: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3.5C6.8 2.4 5 2 2.5 2v11c2.5 0 4.3.4 5.5 1.5 1.2-1.1 3-1.5 5.5-1.5V2C11 2 9.2 2.4 8 3.5z"/><path d="M8 3.5v11"/></svg>'
+  book: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 3.5C6.8 2.4 5 2 2.5 2v11c2.5 0 4.3.4 5.5 1.5 1.2-1.1 3-1.5 5.5-1.5V2C11 2 9.2 2.4 8 3.5z"/><path d="M8 3.5v11"/></svg>',
+  eye: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M1.5 8s2.4-4.2 6.5-4.2S14.5 8 14.5 8 12.1 12.2 8 12.2 1.5 8 1.5 8z"/><circle cx="8" cy="8" r="2.1"/></svg>'
 };
 const CODE_EXT = new Set(['js','mjs','cjs','ts','tsx','jsx','vue','py','rb','go','rs','c','h','cpp','swift','sh','zsh','bash','sql','css','scss','html']);
 const IMG_EXT = new Set(['png','jpg','jpeg','gif','svg','webp','ico','heic','pdf']);
@@ -731,14 +791,22 @@ function makeRow(e, parentRel) {
   const name = document.createElement('span'); name.className = 'name';
   name.textContent = e.name; name.title = e.name;
   row.appendChild(name);
-  const ext = (e.name.split('.').pop() || '').toLowerCase();
-  if (e.type === 'file' && MD_EXT.has(ext)) {
-    const mb = document.createElement('button');
-    mb.className = 'mdbtn'; mb.innerHTML = SVG.book;
-    mb.title = 'markdown ビューアで開く';
-    mb.setAttribute('aria-label', e.name + ' をビューアで開く');
-    mb.addEventListener('click', (ev) => { ev.stopPropagation(); openMd(rel); });
-    row.appendChild(mb);
+  if (e.type === 'file') {
+    const ext = (e.name.split('.').pop() || '').toLowerCase();
+    const isMd = MD_EXT.has(ext), isImg = IMG_EXT.has(ext), isPdf = ext === 'pdf';
+    const vb = document.createElement('button');
+    vb.className = 'mdbtn';
+    vb.innerHTML = isMd ? SVG.book : (isImg || isPdf) ? SVG.img : SVG.eye;
+    vb.title = isMd ? 'markdown ビューアで開く' : (isImg || isPdf) ? '画像を表示' : 'コードを表示';
+    vb.setAttribute('aria-label', e.name + ' をプレビュー');
+    vb.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (isMd) openMd(rel);
+      else if (isPdf) location.href = '/raw?path=' + encodeURIComponent(rel);
+      else if (isImg) location.href = '/img?path=' + encodeURIComponent(rel);
+      else location.href = '/code?path=' + encodeURIComponent(rel);
+    });
+    row.appendChild(vb);
   }
   const hint = document.createElement('span'); hint.className = 'copy-hint'; hint.textContent = 'copy';
   row.appendChild(hint);
@@ -933,6 +1001,129 @@ new EventSource('/api/events').onmessage = (ev) => {
 </script>
 </body>
 </html>`;
+}
+
+// ビューアページ共通の外殻 (バー + テーマ変数)
+function viewerShell(rel, title, extraHead, bodyHtml) {
+  const name = rel.split('/').pop();
+  const parent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+  return `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+:root {
+  --bg: #101312; --bg-raise: #171b19; --text: #d7dcd3; --dim: #8d968b;
+  --faint: #5c6459; --accent: #e2a656; --accent-soft: rgba(226,166,86,.14);
+  --border: #262d27;
+  --tok-kw: #e2a656; --tok-str: #9fc78a; --tok-num: #d2a8e0; --tok-com: #5c6459;
+  --tok-fn: #8fb3c7; --tok-attr: #c9a86e;
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg: #f5f2ea; --bg-raise: #ede9de; --text: #33372f; --dim: #6d7367;
+    --faint: #9aa090; --accent: #a86a1e; --accent-soft: rgba(168,106,30,.12); --border: #d5cfbf;
+    --tok-kw: #a86a1e; --tok-str: #4d7a33; --tok-num: #7551a3; --tok-com: #9aa090;
+    --tok-fn: #3d6d8a; --tok-attr: #8a6a2c; }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: ui-monospace, "SF Mono", Menlo, "Hiragino Sans", monospace;
+  font-size: 14px; font-weight: 500; line-height: 1.65;
+  -webkit-font-smoothing: antialiased; overflow-x: hidden;
+}
+.bar {
+  position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 10px;
+  padding: 9px 14px; background: color-mix(in srgb, var(--bg) 90%, transparent);
+  backdrop-filter: blur(6px); border-bottom: 1px solid var(--border); font-size: 13px;
+}
+.bar a { color: var(--accent); text-decoration: none; font-weight: 700; white-space: nowrap; }
+.bar .fn { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.bar .meta { margin-left: auto; color: var(--faint); font-size: 12px; white-space: nowrap; }
+${extraHead}
+</style>
+</head>
+<body>
+<div class="bar"><a href="/">← ツリー</a><span class="fn" title="${escapeHtml(rel)}">${escapeHtml(name)}</span><span class="meta" id="meta"></span></div>
+${bodyHtml}
+<script>
+const PARENT = ${JSON.stringify(parent)};
+new EventSource('/api/events').onmessage = (ev) => {
+  try { if (JSON.parse(ev.data).dir === PARENT) location.reload(); } catch {}
+};
+</script>
+</body>
+</html>`;
+}
+
+// 画像ビューア
+function renderImgPage(root, rel) {
+  const name = rel.split('/').pop();
+  const css = `
+main { display: flex; align-items: center; justify-content: center; min-height: calc(100vh - 42px); padding: 20px; }
+.frame {
+  background:
+    repeating-conic-gradient(color-mix(in srgb, var(--text) 7%, transparent) 0% 25%, transparent 0% 50%)
+    0 0 / 18px 18px;
+  border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-width: 100%;
+}
+.frame img { display: block; max-width: 100%; height: auto; }`;
+  const body = `
+<main><div class="frame"><img id="im" src="/raw?path=${encodeURIComponent(rel)}" alt="${escapeHtml(name)}"></div></main>
+<script>
+document.getElementById('im').addEventListener('load', function () {
+  document.getElementById('meta').textContent = this.naturalWidth + ' × ' + this.naturalHeight;
+});
+</script>`;
+  return viewerShell(rel, `${name} — ctree`, css, body);
+}
+
+// コードビューア: word wrap 常時有効。シンタックスハイライトは highlight.js を
+// CDN から読み込み (190+ 言語)、オフライン等で読めない場合はプレーン表示のまま。
+// 配色は hljs の CSS ではなく自前のテーマ変数で定義する
+function renderCodePage(root, rel, text, note) {
+  const name = rel.split('/').pop();
+  const base = name.toLowerCase();
+  const ext = base.includes('.') ? base.split('.').pop() : base; // Dockerfile / Makefile 対応
+  const lang = HLJS_LANG[ext] || '';
+  const css = `
+main { padding: 14px 0 40px; }
+pre.code {
+  white-space: pre-wrap;           /* word wrap */
+  overflow-wrap: anywhere;
+  font-size: 13px; line-height: 1.7; font-weight: 500;
+  padding: 6px 16px;
+}
+.note { color: var(--dim); padding: 30px 16px; }
+/* highlight.js トークン → 自前パレット */
+.hljs-keyword, .hljs-literal, .hljs-selector-tag, .hljs-built_in, .hljs-doctag { color: var(--tok-kw); }
+.hljs-string, .hljs-regexp, .hljs-addition { color: var(--tok-str); }
+.hljs-number, .hljs-symbol, .hljs-bullet { color: var(--tok-num); }
+.hljs-comment, .hljs-quote, .hljs-deletion, .hljs-meta { color: var(--tok-com); font-style: italic; }
+.hljs-title, .hljs-section, .hljs-name, .hljs-function { color: var(--tok-fn); }
+.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable,
+.hljs-type, .hljs-selector-class, .hljs-selector-attr, .hljs-params { color: var(--tok-attr); }
+.hljs-emphasis { font-style: italic; } .hljs-strong { font-weight: 700; }`;
+  const body = note
+    ? `<main><p class="note">${escapeHtml(note)}</p></main>`
+    : `
+<main><pre class="code"><code id="c"${lang ? ` class="language-${lang}"` : ''}>${escapeHtml(text)}</code></pre></main>
+<script>
+(function () {
+  var lines = ${JSON.stringify(text ? String(text.split('\n').length) : '0')};
+  document.getElementById('meta').textContent = lines + ' 行';
+  var s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.11.1/build/highlight.min.js';
+  s.onload = function () {
+    try { window.hljs && hljs.highlightElement(document.getElementById('c')); } catch (e) {}
+  };
+  s.onerror = function () {}; // オフライン時はプレーン表示のまま (word wrap は効いている)
+  document.head.appendChild(s);
+})();
+</script>`;
+  return viewerShell(rel, `${name} — ctree`, css, body);
 }
 
 function escapeHtml(s) {

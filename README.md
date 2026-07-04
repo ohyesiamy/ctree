@@ -55,5 +55,5 @@ ctree --no-open    # ペインを開かず URL だけ表示
 ## テスト
 
 ```sh
-node --test test/
+node --test
 ```

@@ -1,6 +1,6 @@
 {
   "name": "@ohyesiamy/ctree",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Editor-style file tree for cmux — click any file to copy its absolute path. Ships markdown, code, and image viewers. Zero dependencies.",
   "bin": {
     "ctree": "./ctree.js"

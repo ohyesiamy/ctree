@@ -78,6 +78,38 @@ test('renderMarkdown: 主要要素の変換と HTML エスケープ', () => {
   assert.ok(html.includes('<th>A</th>') && html.includes('<td>&lt;s&gt;</td>')); // 表 + エスケープ
 });
 
+test('renderMarkdown: mermaid フェンスは pre.mermaid、通常フェンスは code のまま', () => {
+  const html = renderMarkdown([
+    '```mermaid', 'graph TD;', 'A["<x>"] --> B;', '```', '',
+    '```js', 'const y = 1;', '```',
+  ].join('\n'));
+  // mermaid は描画対象クラス付き pre、ソースはエスケープして保持 (textContent で復号される)
+  assert.ok(html.includes('<pre class="mermaid">graph TD;\nA[&quot;&lt;x&gt;&quot;] --&gt; B;</pre>'));
+  // 通常のコードブロックには mermaid クラスを付けない
+  assert.ok(html.includes('<pre><code>const y = 1;</code></pre>'));
+  assert.ok(!html.includes('<pre class="mermaid">const y = 1;'));
+});
+
+test('renderMarkdown: LaTeX 数式 (インライン/ブロック) を KaTeX 用に退避', () => {
+  const html = renderMarkdown([
+    '質量エネルギーは $E = mc^2$ で表される。',
+    '', '$$', '\\int_0^1 x\\,dx = \\frac{1}{2}', '$$', '',
+    '$$a^2 + b^2 = c^2$$', // 単独行の同一行ブロック
+    'テキスト中の $$x=1$$ 表示数式', // 段落中の $$ は inline 扱い
+    '', '価格は $5 から $10 の範囲。', // 通貨: 空白隣接で数式化しない
+  ].join('\n'));
+  // インライン数式: 式は markdown 処理されずエスケープ保持
+  assert.ok(html.includes('<span class="math">E = mc^2</span>'));
+  // ブロック数式 (複数行): math-display、\ と _ が壊れない
+  assert.ok(html.includes('<div class="math math-display">\\int_0^1 x\\,dx = \\frac{1}{2}</div>'));
+  // 単独行の同一行ブロックは div
+  assert.ok(html.includes('<div class="math math-display">a^2 + b^2 = c^2</div>'));
+  // 段落中の $$ は inline span (display モード)
+  assert.ok(html.includes('<span class="math math-display">x=1</span>'));
+  // 通貨表記は数式化しない ($ に空白隣接)
+  assert.ok(!html.includes('class="math">5 から'));
+});
+
 function req(port, method, p, body) {
   return new Promise((resolve, reject) => {
     const r = http.request({ host: '127.0.0.1', port, method, path: p,
@@ -179,6 +211,32 @@ test('HTTP API: ping / tree / 403 / copy', async () => {
   assert.ok(img.body.includes('/raw?path=logo.svg'));
   const rawOut = await req(port, 'GET', '/raw?path=..%2F..%2Fetc%2Fhosts');
   assert.strictEqual(rawOut.status, 403);
+
+  // エディタページ: 分割プレビュー UI を返す
+  fs.writeFileSync(path.join(root, 'note.md'), '# 元の見出し\n');
+  const editPage = await req(port, 'GET', '/edit?path=note.md');
+  assert.strictEqual(editPage.status, 200);
+  assert.ok(editPage.body.includes('id="src"') && editPage.body.includes('id="preview"'));
+  // markdown 以外は編集不可
+  const editBad = await req(port, 'GET', '/edit?path=app.ts');
+  assert.strictEqual(editBad.status, 400);
+
+  // /api/render: ビューアと同じレンダラで HTML を返す
+  const rendered = await req(port, 'POST', '/api/render', { content: '# 見出し\n$x^2$' });
+  assert.strictEqual(rendered.status, 200);
+  assert.ok(JSON.parse(rendered.body).html.includes('<h1>見出し</h1>'));
+
+  // /api/write: 保存成功 (既存 md を上書き)
+  const wr = await req(port, 'POST', '/api/write', { path: 'note.md', content: '# 更新後\n本文。\n' });
+  assert.strictEqual(wr.status, 200);
+  assert.strictEqual(fs.readFileSync(path.join(root, 'note.md'), 'utf8'), '# 更新後\n本文。\n');
+  // root 外は 403 / 非 md は 400 / 存在しない md は 404
+  const wrOut = await req(port, 'POST', '/api/write', { path: '../evil.md', content: 'x' });
+  assert.strictEqual(wrOut.status, 403);
+  const wrExt = await req(port, 'POST', '/api/write', { path: 'app.ts', content: 'x' });
+  assert.strictEqual(wrExt.status, 400);
+  const wrMissing = await req(port, 'POST', '/api/write', { path: 'nope.md', content: 'x' });
+  assert.strictEqual(wrMissing.status, 404);
 
   server.close();
   delete process.env.CTREE_COPY_CMD;

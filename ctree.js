@@ -112,12 +112,26 @@ function listDir(root, rel, showHidden, ignored) {
 // フォールバック表示用
 function renderMarkdown(src) {
   const esc = (s) => escapeHtml(s);
-  const inline = (s) => esc(s)
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>')
-    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, '<em>[画像: $1]</em>')
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" rel="noopener">$1</a>');
+  const inline = (s) => {
+    // 数式 ($$...$$ / $...$) を先に退避し、markdown 変換・エスケープから守る。
+    // 実際の描画はブラウザ側の KaTeX が行う (textContent から元の式を読む)
+    const math = [];
+    const stash = (tex, display) => '\x00M' + (math.push({ tex, display }) - 1) + '\x00';
+    s = s
+      .replace(/\$\$([^\n]+?)\$\$/g, (_m, t) => stash(t, true))
+      // インライン数式: 区切り $ に空白を隣接させない (通貨表記との誤検出を避ける)
+      .replace(/\$(?![ \t])((?:[^$\\]|\\.)+?)(?<![ \t])\$/g, (_m, t) => stash(t, false));
+    const html = esc(s)
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>')
+      .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, '<em>[画像: $1]</em>')
+      .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" rel="noopener">$1</a>');
+    return html.replace(/\x00M(\d+)\x00/g, (_m, i) => {
+      const { tex, display } = math[+i];
+      return `<span class="math${display ? ' math-display' : ''}">${esc(tex)}</span>`;
+    });
+  };
   const lines = src.split(/\r?\n/);
   const out = [];
   let list = null, quote = false, para = [];
@@ -132,7 +146,30 @@ function renderMarkdown(src) {
       closeAll();
       const buf = [];
       for (i++; i < lines.length && !/^```/.test(lines[i]); i++) buf.push(lines[i]);
-      out.push('<pre><code>' + esc(buf.join('\n')) + '</code></pre>');
+      // mermaid はダイアグラムとして描画する (実際のレンダリングは mermaid.js が
+      // ブラウザ側で行う)。エスケープしても textContent は復号されるので安全。
+      // CDN が読めない / 構文エラー時は元のソースがそのまま可読テキストとして残る
+      if (fence[1] === 'mermaid') {
+        out.push('<pre class="mermaid">' + esc(buf.join('\n')) + '</pre>');
+      } else {
+        out.push('<pre><code>' + esc(buf.join('\n')) + '</code></pre>');
+      }
+      continue;
+    }
+    // ブロック数式: 単独行の $$ で開き、同一行 or 後続行の $$ で閉じる
+    if (/^\$\$/.test(line)) {
+      closeAll();
+      const oneLine = line.match(/^\$\$([\s\S]+?)\$\$\s*$/);
+      if (oneLine) {
+        out.push('<div class="math math-display">' + esc(oneLine[1].trim()) + '</div>');
+        continue;
+      }
+      const buf = [line.replace(/^\$\$/, '')];
+      for (i++; i < lines.length; i++) {
+        if (/\$\$\s*$/.test(lines[i])) { buf.push(lines[i].replace(/\$\$\s*$/, '')); break; }
+        buf.push(lines[i]);
+      }
+      out.push('<div class="math math-display">' + esc(buf.join('\n').trim()) + '</div>');
       continue;
     }
     const h = line.match(/^(#{1,6})\s+(.*)/);
@@ -303,6 +340,49 @@ function createApp(root) {
         } catch (e) {
           json(res, 500, { error: readableFsError(e) });
         }
+      } else if (url.pathname === '/edit') {
+        const rel = safeRel(root, url.searchParams.get('path') || '');
+        if (rel === null) return json(res, 403, { error: 'root 外のパスです' });
+        const ext = (rel.split('.').pop() || '').toLowerCase();
+        if (!['md', 'mdx', 'markdown'].includes(ext)) return json(res, 400, { error: 'markdown ファイルのみ編集できます' });
+        try {
+          const abs = path.join(root, ...rel.split('/').filter(Boolean));
+          const src = fs.readFileSync(abs, 'utf8');
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+          res.end(renderEditPage(root, rel, src));
+        } catch (e) {
+          json(res, 500, { error: readableFsError(e) });
+        }
+      } else if (url.pathname === '/api/render' && req.method === 'POST') {
+        // プレビュー用: 本文を受け取りビューアと同一のレンダラで HTML を返す
+        let body = ''; let over = false;
+        req.on('data', (c) => { body += c; if (body.length > 5 * 1024 * 1024) { over = true; req.destroy(); } });
+        req.on('end', () => {
+          if (over) return json(res, 413, { error: 'コンテンツが大きすぎます' });
+          let content;
+          try { content = JSON.parse(body).content; } catch { return json(res, 400, { error: 'bad json' }); }
+          json(res, 200, { html: renderMarkdown(String(content == null ? '' : content)) });
+        });
+      } else if (url.pathname === '/api/write' && req.method === 'POST') {
+        // 保存: root 内 & markdown 拡張子 & 既存ファイルに限定して上書き
+        let body = ''; let over = false;
+        req.on('data', (c) => { body += c; if (body.length > 5 * 1024 * 1024) { over = true; req.destroy(); } });
+        req.on('end', () => {
+          if (over) return json(res, 413, { error: 'ファイルが大きすぎます' });
+          let p, content;
+          try { const j = JSON.parse(body); p = j.path; content = j.content; } catch { return json(res, 400, { error: 'bad json' }); }
+          const rel = safeRel(root, p || '');
+          if (rel === null) return json(res, 403, { error: 'root 外のパスです' });
+          const ext = (rel.split('.').pop() || '').toLowerCase();
+          if (!['md', 'mdx', 'markdown'].includes(ext)) return json(res, 400, { error: 'markdown ファイルのみ保存できます' });
+          if (typeof content !== 'string') return json(res, 400, { error: 'content が不正です' });
+          const abs = path.join(root, ...rel.split('/').filter(Boolean));
+          let st;
+          try { st = fs.statSync(abs); } catch { return json(res, 404, { error: '対象ファイルが見つかりません' }); }
+          if (!st.isFile()) return json(res, 400, { error: 'ファイルではありません' });
+          try { fs.writeFileSync(abs, content, 'utf8'); json(res, 200, { ok: true }); }
+          catch (e) { json(res, 500, { error: readableFsError(e) }); }
+        });
       } else if (url.pathname === '/api/open-md' && req.method === 'POST') {
         let body = '';
         req.on('data', (c) => { body += c; });
@@ -919,18 +999,8 @@ refreshDir('');
 </html>`;
 }
 
-// in-page markdown ビューアページ (ネイティブビューアが使えない時のフォールバック)
-function renderMdPage(root, rel, bodyHtml) {
-  const name = rel.split('/').pop();
-  const parent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
-  return `<!doctype html>
-<html lang="ja">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeHtml(name)} — ctree</title>
-<style>
-:root {
+// markdown ビューア/エディタで共有するテーマ変数 + リセット
+const MD_THEME_CSS = `:root {
   --bg: #101312; --bg-raise: #171b19; --text: #d7dcd3; --dim: #8d968b;
   --faint: #5c6459; --accent: #e2a656; --accent-soft: rgba(226,166,86,.14);
   --border: #262d27;
@@ -939,24 +1009,11 @@ function renderMdPage(root, rel, bodyHtml) {
   :root { --bg: #f5f2ea; --bg-raise: #ede9de; --text: #33372f; --dim: #6d7367;
     --faint: #9aa090; --accent: #a86a1e; --accent-soft: rgba(168,106,30,.12); --border: #d5cfbf; }
 }
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  background: var(--bg); color: var(--text);
-  font-family: "Hiragino Sans", ui-monospace, "SF Mono", Menlo, sans-serif;
-  font-size: 15px; font-weight: 500; line-height: 1.85;
-  -webkit-font-smoothing: antialiased;
-  font-feature-settings: "palt", "calt"; line-break: strict;
-  overflow-x: hidden;
-}
-.bar {
-  position: sticky; top: 0; display: flex; align-items: center; gap: 10px;
-  padding: 9px 14px; background: color-mix(in srgb, var(--bg) 90%, transparent);
-  backdrop-filter: blur(6px); border-bottom: 1px solid var(--border);
-  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px;
-}
-.bar a { color: var(--accent); text-decoration: none; font-weight: 700; white-space: nowrap; }
-.bar .fn { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-article { max-width: 760px; padding: 22px 18px 60px; margin: 0 auto; }
+* { box-sizing: border-box; margin: 0; padding: 0; }`;
+
+// レンダリング済み markdown の見た目 (ビューアとエディタのプレビューで共有)
+const MD_ARTICLE_CSS = `article { max-width: 760px; padding: 22px 18px 60px; margin: 0 auto;
+  font-family: var(--md-font, "Hiragino Sans", ui-monospace, "SF Mono", Menlo, sans-serif); }
 article h1, article h2, article h3, article h4 {
   text-wrap: balance; word-break: auto-phrase; overflow-wrap: normal;
   color: var(--text); margin: 1.4em 0 .5em; line-height: 1.4;
@@ -979,6 +1036,18 @@ article pre {
   padding: 12px 14px; overflow-x: auto; margin: .8em 0;
 }
 article pre code { background: none; border: 0; padding: 0; font-size: 13px; line-height: 1.7; }
+article pre.mermaid {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px;
+  line-height: 1.7; white-space: pre-wrap; color: var(--dim);
+}
+article pre.mermaid[data-processed] {
+  background: none; border: 0; padding: 8px 0; text-align: center;
+  white-space: normal; line-height: 1.5; overflow-x: auto;
+}
+article pre.mermaid[data-processed] svg { max-width: 100%; height: auto; }
+.math-display { display: block; text-align: center; margin: .9em 0; overflow-x: auto; overflow-y: hidden; }
+.katex { color: var(--text); }
+.katex-error { color: var(--accent) !important; }
 article blockquote { border-left: 3px solid var(--accent); padding: 2px 0 2px 14px; color: var(--dim); margin: .8em 0; }
 article hr { border: 0; border-top: 1px solid var(--border); margin: 1.6em 0; }
 article a { color: var(--accent); }
@@ -986,18 +1055,358 @@ article a { color: var(--accent); }
 article table { border-collapse: collapse; font-size: 13.5px; min-width: 320px; }
 article th, article td { border: 1px solid var(--border); padding: 6px 11px; text-align: left; }
 article th { background: var(--bg-raise); font-weight: 700; }
-@media (max-width: 340px) { article { padding: 16px 12px 50px; } body { font-size: 14px; } }
+@media (max-width: 340px) { article { padding: 16px 12px 50px; } body { font-size: 14px; } }`;
+
+// mermaid + KaTeX を必要時に CDN からロードし、渡した要素内を描画する共通処理。
+// window.__mdEnhance(root) は複数回呼べる (エディタのライブプレビュー用)。
+// CDN 不達 / 構文エラー時は元テキストが残る (graceful fallback)
+const MD_ENHANCE_JS = `<script>
+(function () {
+  var dark = !window.matchMedia || window.matchMedia('(prefers-color-scheme: dark)').matches;
+  var MER = dark
+    ? { background:'#101312', primaryColor:'#1c2320', primaryBorderColor:'#e2a656', primaryTextColor:'#e7ece3',
+        secondaryColor:'#20262a', secondaryBorderColor:'#8fb3c7', secondaryTextColor:'#e7ece3',
+        tertiaryColor:'#241f2b', tertiaryBorderColor:'#d2a8e0', tertiaryTextColor:'#e7ece3',
+        lineColor:'#8d968b', textColor:'#d7dcd3', titleColor:'#e2a656', nodeTextColor:'#e7ece3',
+        mainBkg:'#1c2320', nodeBorder:'#e2a656', clusterBkg:'#171b19', clusterBorder:'#262d27',
+        edgeLabelBackground:'#171b19', labelBackground:'#171b19', actorBkg:'#1c2320', actorBorder:'#e2a656',
+        actorTextColor:'#e7ece3', signalColor:'#8d968b', signalTextColor:'#e7ece3', labelBoxBkgColor:'#1c2320',
+        labelBoxBorderColor:'#e2a656', labelTextColor:'#e7ece3', loopTextColor:'#e7ece3', noteBkgColor:'#241f2b',
+        noteBorderColor:'#d2a8e0', noteTextColor:'#e7ece3', pie1:'#e2a656', pie2:'#8fb3c7', pie3:'#d2a8e0',
+        pieTitleTextColor:'#e7ece3', pieSectionTextColor:'#e7ece3', pieStrokeColor:'#101312' }
+    : { background:'#f5f2ea', primaryColor:'#ece7d8', primaryBorderColor:'#a86a1e', primaryTextColor:'#25281f',
+        secondaryColor:'#e2ebe6', secondaryBorderColor:'#3d6d8a', secondaryTextColor:'#25281f',
+        tertiaryColor:'#ece3ee', tertiaryBorderColor:'#7551a3', tertiaryTextColor:'#25281f',
+        lineColor:'#6d7367', textColor:'#33372f', titleColor:'#a86a1e', nodeTextColor:'#25281f',
+        mainBkg:'#ece7d8', nodeBorder:'#a86a1e', clusterBkg:'#ede9de', clusterBorder:'#d5cfbf',
+        edgeLabelBackground:'#ede9de', labelBackground:'#ede9de', actorBkg:'#ece7d8', actorBorder:'#a86a1e',
+        actorTextColor:'#25281f', signalColor:'#6d7367', signalTextColor:'#25281f', labelBoxBkgColor:'#ece7d8',
+        labelBoxBorderColor:'#a86a1e', labelTextColor:'#25281f', loopTextColor:'#25281f', noteBkgColor:'#ece3ee',
+        noteBorderColor:'#7551a3', noteTextColor:'#25281f', pie1:'#a86a1e', pie2:'#3d6d8a', pie3:'#7551a3',
+        pieTitleTextColor:'#25281f', pieSectionTextColor:'#25281f', pieStrokeColor:'#f5f2ea' };
+  var mermaidP = null, katexP = null;
+  function loadJs(src){ return new Promise(function(res,rej){ var s=document.createElement('script'); s.src=src; s.onload=res; s.onerror=rej; document.head.appendChild(s); }); }
+  function loadCss(href){ var l=document.createElement('link'); l.rel='stylesheet'; l.href=href; document.head.appendChild(l); }
+  window.__mdEnhance = function (root) {
+    root = root || document;
+    var mer = root.querySelectorAll('pre.mermaid');
+    if (mer.length) {
+      if (!mermaidP) mermaidP = loadJs('https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js').then(function () {
+        if (typeof mermaid !== 'undefined') mermaid.initialize({ startOnLoad:false, securityLevel:'strict',
+          fontFamily:'"Hiragino Sans", ui-monospace, "SF Mono", Menlo, sans-serif', theme:'base', themeVariables: MER });
+      });
+      mermaidP.then(function () { try { if (typeof mermaid !== 'undefined') mermaid.run({ nodes: mer }); } catch (e) {} });
+    }
+    var math = root.querySelectorAll('.math');
+    if (math.length) {
+      if (!katexP) { loadCss('https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css'); katexP = loadJs('https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js'); }
+      katexP.then(function () {
+        if (typeof katex === 'undefined') return;
+        math.forEach(function (el) { try { katex.render(el.textContent, el, { displayMode: el.classList.contains('math-display'), throwOnError:false, errorColor:'var(--accent)' }); } catch (e) {} });
+      });
+    }
+  };
+})();
+</script>`;
+
+// in-page markdown ビューアページ (ネイティブビューアが使えない時のフォールバック)
+function renderMdPage(root, rel, bodyHtml) {
+  const name = rel.split('/').pop();
+  const parent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : '';
+  return `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(name)} — ctree</title>
+<style>
+${MD_THEME_CSS}
+body {
+  background: var(--bg); color: var(--text);
+  font-family: "Hiragino Sans", ui-monospace, "SF Mono", Menlo, sans-serif;
+  font-size: 15px; font-weight: 500; line-height: 1.85;
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: "palt", "calt"; line-break: strict;
+  overflow-x: hidden;
+}
+.bar {
+  position: sticky; top: 0; display: flex; align-items: center; gap: 10px;
+  padding: 9px 14px; background: color-mix(in srgb, var(--bg) 90%, transparent);
+  backdrop-filter: blur(6px); border-bottom: 1px solid var(--border);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px;
+}
+.bar a { color: var(--accent); text-decoration: none; font-weight: 700; white-space: nowrap; }
+.bar .fn { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+${MD_ARTICLE_CSS}
+/* --- フォント切り替え: article に --md-font を適用 (コード/数式は等幅を保つ) --- */
+article { font-family: var(--md-font, "Hiragino Sans", ui-monospace, "SF Mono", Menlo, sans-serif); }
+html[data-mdfont="mincho"]   { --md-font: "Hiragino Mincho ProN", "YuMincho", "Yu Mincho", serif; }
+html[data-mdfont="yugothic"] { --md-font: "YuGothic", "Yu Gothic", "Hiragino Sans", sans-serif; }
+html[data-mdfont="mono"]     { --md-font: ui-monospace, "SF Mono", Menlo, "Hiragino Sans", monospace; }
+/* --- 縦書き: article 本文のみ縦組みにし、図表・コード・数式は横組みに戻す --- */
+html.vertical article {
+  writing-mode: vertical-rl; text-orientation: mixed;
+  max-width: none; margin: 0; height: calc(100vh - 42px);
+  padding: 26px 22px; overflow-x: auto; overflow-y: hidden;
+  line-height: 2.05; letter-spacing: .02em;
+}
+html.vertical article pre,
+html.vertical article .tblwrap,
+html.vertical article table,
+html.vertical article .math-display,
+html.vertical article pre.mermaid { writing-mode: horizontal-tb; text-orientation: mixed; }
+html.vertical article h1 { border-bottom: 0; border-left: 2px solid var(--border); padding: 0 0 0 .35em; }
+html.vertical article hr { border-top: 0; border-right: 1px solid var(--border); width: 0; height: auto; margin: 0 1.4em; }
+/* 縦書きは横スクロールで読むので、ペインで隠れがちな横バーを常時見せる */
+html.vertical article { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+html.vertical article::-webkit-scrollbar { height: 10px; }
+html.vertical article::-webkit-scrollbar-thumb { background: var(--border); border-radius: 5px; }
+html.vertical article::-webkit-scrollbar-thumb:hover { background: var(--faint); }
+html.vertical article::-webkit-scrollbar-track { background: transparent; }
+/* --- ツールバーの切替コントロール --- */
+.bar .ctl { margin-left: auto; display: flex; gap: 6px; align-items: center; flex: none; }
+.bar select, .bar button {
+  font: inherit; font-size: 12px; color: var(--text);
+  background: var(--bg-raise); border: 1px solid var(--border);
+  border-radius: 5px; padding: 3px 6px; cursor: pointer;
+}
+.bar select { max-width: 92px; }
+.bar button { min-width: 32px; font-weight: 700; }
+.bar button.on { color: var(--accent); border-color: var(--accent); }
 </style>
+<script>
+// 保存済みの表示設定を描画前に適用 (リロード時のちらつき防止)
+(function () {
+  try {
+    var d = document.documentElement;
+    var f = localStorage.getItem('ctree.mdfont');
+    if (f && f !== 'gothic') d.setAttribute('data-mdfont', f);
+    if (localStorage.getItem('ctree.vertical') === '1') d.classList.add('vertical');
+  } catch (e) {}
+})();
+</script>
 </head>
 <body>
-<div class="bar"><a href="/">← ツリー</a><span class="fn" title="${escapeHtml(rel)}">${escapeHtml(name)}</span></div>
+<div class="bar"><a href="/">← ツリー</a><span class="fn" title="${escapeHtml(rel)}">${escapeHtml(name)}</span><span class="ctl"><a href="/edit?path=${encodeURIComponent(rel)}" title="このファイルを編集">編集</a><select id="fontsel" title="フォント" aria-label="フォント"><option value="gothic">ゴシック</option><option value="mincho">明朝</option><option value="yugothic">游ゴシック</option><option value="mono">等幅</option></select><button id="vtoggle" type="button" title="縦書きにする">縦</button></span></div>
 <article>${bodyHtml}</article>
+<script>
+// 縦書き / フォント切り替え (状態は localStorage に保存し、リロードをまたいで保持)
+(function () {
+  const d = document.documentElement;
+  const art = document.querySelector('article');
+  const sel = document.getElementById('fontsel');
+  const vt = document.getElementById('vtoggle');
+  const save = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+  // 縦書き-rl は読み始めが右端なので、有効時はスクロールを右へ寄せる
+  const alignStart = (on) => { if (on) art.scrollLeft = art.scrollWidth; };
+  const setV = (on) => {
+    d.classList.toggle('vertical', on);
+    vt.classList.toggle('on', on);
+    vt.textContent = on ? '横' : '縦';
+    vt.title = on ? '横書きに戻す' : '縦書きにする';
+    alignStart(on);
+  };
+  sel.value = d.getAttribute('data-mdfont') || 'gothic';
+  setV(d.classList.contains('vertical'));
+  sel.addEventListener('change', () => {
+    if (sel.value === 'gothic') d.removeAttribute('data-mdfont');
+    else d.setAttribute('data-mdfont', sel.value);
+    save('ctree.mdfont', sel.value);
+    alignStart(d.classList.contains('vertical'));
+  });
+  vt.addEventListener('click', () => {
+    const on = !d.classList.contains('vertical');
+    setV(on);
+    save('ctree.vertical', on ? '1' : '0');
+  });
+
+  // --- 縦書き時の横スクロール手段 ---
+  // scrollLeft の RTL 符号は Chromium 版で揺れるため方向仮定を避ける:
+  //   先頭へ = scrollWidth 代入 / 末尾へ = -scrollWidth 代入 (どちらもクランプで両規約に耐える)
+  //   読み進める(次の列=左) = scrollLeft を減算
+  const vertical = () => d.classList.contains('vertical');
+
+  // ① 縦ホイール / トラックパッドの縦ジェスチャを横スクロールに変換。
+  //    横入力(トラックパッドの横スワイプ)はブラウザ標準に任せる
+  window.addEventListener('wheel', (e) => {
+    if (!vertical()) return;
+    if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+    const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? art.clientWidth : 1; // 行/ページ単位を px 換算
+    art.scrollLeft -= e.deltaY * k;
+    e.preventDefault();
+  }, { passive: false });
+
+  // ② キーボード: ← / Space / PageDown で読み進め、→ / PageUp で戻る、Home/End で端へ
+  window.addEventListener('keydown', (e) => {
+    if (!vertical()) return;
+    const t = e.target;
+    if (t && (t.tagName === 'SELECT' || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+    const step = Math.max(80, art.clientWidth * 0.9);
+    if (e.key === 'ArrowLeft' || e.key === 'PageDown' || (e.key === ' ' && !e.shiftKey)) { art.scrollLeft -= step; }
+    else if (e.key === 'ArrowRight' || e.key === 'PageUp' || (e.key === ' ' && e.shiftKey)) { art.scrollLeft += step; }
+    else if (e.key === 'Home') { art.scrollLeft = art.scrollWidth; }
+    else if (e.key === 'End') { art.scrollLeft = -art.scrollWidth; }
+    else return;
+    e.preventDefault();
+  });
+})();
+</script>
+${MD_ENHANCE_JS}
+<script>window.__mdEnhance(document);</script>
 <script>
 // 同ディレクトリの変更でライブ更新
 const PARENT = ${JSON.stringify(parent)};
 new EventSource('/api/events').onmessage = (ev) => {
   try { if (JSON.parse(ev.data).dir === PARENT) location.reload(); } catch {}
 };
+</script>
+</body>
+</html>`;
+}
+
+// markdown エディタページ (左=編集 / 右=ライブプレビュー、Cmd+S で保存)
+function renderEditPage(root, rel, src) {
+  const name = rel.split('/').pop();
+  return `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(name)} — 編集 — ctree</title>
+<style>
+${MD_THEME_CSS}
+html, body { height: 100%; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: "Hiragino Sans", ui-monospace, "SF Mono", Menlo, sans-serif;
+  font-size: 15px; font-weight: 500; -webkit-font-smoothing: antialiased;
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.bar {
+  flex: none; display: flex; align-items: center; gap: 10px;
+  padding: 9px 14px; background: color-mix(in srgb, var(--bg) 90%, transparent);
+  border-bottom: 1px solid var(--border);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px;
+}
+.bar a { color: var(--accent); text-decoration: none; font-weight: 700; white-space: nowrap; }
+.bar .fn { color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.bar .dirty { color: var(--accent); font-weight: 700; visibility: hidden; }
+.bar .sp { margin-left: auto; }
+.bar button {
+  font: inherit; font-size: 12px; color: var(--text);
+  background: var(--bg-raise); border: 1px solid var(--border);
+  border-radius: 5px; padding: 3px 10px; cursor: pointer; font-weight: 700;
+}
+.bar button:disabled { opacity: .45; cursor: default; }
+.bar button.save { color: var(--accent); border-color: var(--accent); }
+.edit-wrap { flex: 1; display: flex; min-height: 0; }
+.pane { flex: 1 1 50%; min-width: 0; min-height: 0; overflow: auto; }
+.pane.editor { border-right: 1px solid var(--border); display: flex; }
+#src {
+  flex: 1; width: 100%; resize: none; border: 0; outline: none;
+  background: var(--bg); color: var(--text);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13.5px; line-height: 1.75;
+  padding: 16px 16px 60px; tab-size: 2; white-space: pre-wrap; overflow-wrap: normal;
+}
+.pane.preview { background: var(--bg); }
+${MD_ARTICLE_CSS}
+.pane.preview article { max-width: none; margin: 0; padding: 16px 20px 60px; }
+.toast {
+  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+  background: var(--bg-raise); border: 1px solid var(--border); color: var(--text);
+  padding: 8px 16px; border-radius: 8px; font-size: 13px; opacity: 0;
+  transition: opacity .2s; pointer-events: none; z-index: 5;
+}
+.toast.show { opacity: 1; }
+.toast.err { border-color: var(--accent); color: var(--accent); }
+@media (max-width: 640px) {
+  .edit-wrap { flex-direction: column; }
+  .pane.editor { border-right: 0; border-bottom: 1px solid var(--border); }
+}
+</style>
+</head>
+<body>
+<div class="bar">
+  <a href="/">← ツリー</a>
+  <span class="fn" title="${escapeHtml(rel)}">${escapeHtml(name)}</span>
+  <span class="dirty" id="dirty" title="未保存の変更">●</span>
+  <span class="sp"></span>
+  <a href="/md?path=${encodeURIComponent(rel)}" title="ビューアで開く">プレビュー画面</a>
+  <button class="save" id="save" type="button" disabled>保存 <span style="opacity:.7">⌘S</span></button>
+</div>
+<div class="edit-wrap">
+  <div class="pane editor"><textarea id="src" spellcheck="false"></textarea></div>
+  <div class="pane preview"><article id="preview"></article></div>
+</div>
+<div class="toast" id="toast"></div>
+${MD_ENHANCE_JS}
+<script>
+const RAW = ${JSON.stringify(src)};
+const REL = ${JSON.stringify(rel)};
+const ta = document.getElementById('src');
+const pv = document.getElementById('preview');
+const saveBtn = document.getElementById('save');
+const dirtyDot = document.getElementById('dirty');
+const toastEl = document.getElementById('toast');
+let saved = RAW;
+let toastTimer = null;
+ta.value = RAW;
+
+function toast(msg, err) {
+  toastEl.textContent = msg;
+  toastEl.classList.toggle('err', !!err);
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1800);
+}
+function setDirty() {
+  const d = ta.value !== saved;
+  dirtyDot.style.visibility = d ? 'visible' : 'hidden';
+  saveBtn.disabled = !d;
+}
+
+let renderTimer = null;
+async function render() {
+  try {
+    const r = await fetch('/api/render', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: ta.value }) });
+    const j = await r.json();
+    pv.innerHTML = j.html || '';
+    window.__mdEnhance(pv);
+  } catch (e) {}
+}
+function scheduleRender() { clearTimeout(renderTimer); renderTimer = setTimeout(render, 250); }
+
+async function save() {
+  if (ta.value === saved) return;
+  saveBtn.disabled = true;
+  try {
+    const r = await fetch('/api/write', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ path: REL, content: ta.value }) });
+    const j = await r.json();
+    if (r.ok && j.ok) { saved = ta.value; setDirty(); toast('保存しました'); }
+    else { toast(j.error || '保存に失敗しました', true); setDirty(); }
+  } catch (e) { toast('保存に失敗しました', true); setDirty(); }
+}
+
+ta.addEventListener('input', () => { setDirty(); scheduleRender(); });
+// Tab はインデント挿入 (フォーカス移動を抑止)
+ta.addEventListener('keydown', (e) => {
+  if (e.key !== 'Tab') return;
+  e.preventDefault();
+  const s = ta.selectionStart, en = ta.selectionEnd;
+  ta.value = ta.value.slice(0, s) + '  ' + ta.value.slice(en);
+  ta.selectionStart = ta.selectionEnd = s + 2;
+  setDirty(); scheduleRender();
+});
+saveBtn.addEventListener('click', save);
+window.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) { e.preventDefault(); save(); }
+});
+window.addEventListener('beforeunload', (e) => {
+  if (ta.value !== saved) { e.preventDefault(); e.returnValue = ''; }
+});
+
+render();
+setDirty();
 </script>
 </body>
 </html>`;
@@ -1133,7 +1542,7 @@ function escapeHtml(s) {
 
 // ---------------------------------------------------------------- entry
 
-module.exports = { makeIgnoreMatcher, globToRe, listDir, safeRel, createApp, renderHtml, renderMarkdown };
+module.exports = { makeIgnoreMatcher, globToRe, listDir, safeRel, createApp, renderHtml, renderMarkdown, renderEditPage };
 
 if (require.main === module) {
   main(process.argv).then((code) => { if (code) process.exitCode = code; });
